@@ -31,6 +31,7 @@ from torch_geometric.nn import global_add_pool
 from utils.jepa_utils import flatten_context_mask, flatten_target_mask
 from utils.ml_utils import trunc_normal_
 from layers.attention import Block
+from layers.graph_jepa import JEPA_Layer
 
 
 class TransformerPredictor(Module):
@@ -168,3 +169,105 @@ class TransformerPredictor(Module):
             batch_preds.extend(g_x.squeeze(0))
 
         return torch.stack(batch_preds)
+
+
+class JEPA(Module):
+    """
+    Implements JEPA as a Message Passing Layer
+    """
+
+    def __init__(
+        self,
+        encoder: Module,
+        predictor: Module,
+        Z_size: int,
+        shared: bool = False,
+        input_size: int = None,
+        target_percentage: float = 0.1,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+
+        self.encoder = encoder
+        self.target_encoder = copy.deepcopy(encoder)
+        self.target_encoder.reset_parameters()
+
+        # stop gradient
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+
+        self.input_size = input_size
+        self.target_percentage = target_percentage
+        self.shared = shared
+        if shared:
+            self.jepa_blocks = torch.nn.ModuleList(
+                [
+                    JEPA_Layer(
+                        Z_size,
+                        nn=predictor,
+                        input_size=input_size,
+                        target_percentage=target_percentage,
+                        **kwargs,
+                    )
+                ]
+            )
+        else:
+            self.jepa_blocks = torch.nn.ModuleList(
+                [
+                    JEPA_Layer(
+                        Z_size,
+                        nn=predictor,
+                        input_size=input_size,
+                        target_percentage=target_percentage,
+                        **kwargs,
+                    )
+                    for _ in range(len(self.encoder.model))
+                ]
+            )
+
+    def forward(self, x, edge_index):
+
+        # randomly select target nodes
+        tgt_idx = torch.randperm(x.size(0), device=x.device)[
+            : int(self.target_percentage * x.size(0))
+        ]
+        mask = torch.zeros(x.size(0), 1, device=x.device)
+        mask[tgt_idx] = 1
+
+        # replace target nodes with mask token
+        mask_token = torch.randn(1, x.size(-1), device=x.device) * torch.std(
+            x
+        ) + torch.mean(x)
+        mask_tokens = mask_token.repeat(x.size(0), 1)
+
+        x = x * (1 - mask) + (mask * mask_tokens)
+
+        H_pred = []
+        for i, conv in enumerate(self.encoder.model):
+            i = 0 if self.shared else i
+
+            x = conv(x, edge_index)
+            H_hat = self.jepa_blocks[i](x, edge_index)
+            H_pred.append(H_hat)
+
+        return H_pred, tgt_idx, x
+
+    def trainable_parameters(self):
+        return list(self.encoder.named_parameters()) + list(
+            self.jepa_blocks.named_parameters()
+        )
+
+    @torch.no_grad()
+    def update_target_network(self, mm):
+        r"""Performs a momentum update of the target network's weights.
+
+        Args:
+            mm (float): Momentum used in moving average update.
+        """
+        assert 0.0 <= mm <= 1.0, (
+            "Momentum needs to be between 0.0 and 1.0, got %.5f" % mm
+        )
+        for param_q, param_k in zip(
+            self.encoder.parameters(), self.target_encoder.parameters()
+        ):
+            param_k.data.mul_(mm).add_(param_q.data, alpha=1.0 - mm)

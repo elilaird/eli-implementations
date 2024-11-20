@@ -9,7 +9,7 @@ from torch_geometric.typing import (
 from torch_geometric.nn import GINConv
 
 
-# Basic jepa layer that samples a percentage of nodes to mask as the target, then
+# [DEPRECATED] Basic jepa layer that samples a percentage of nodes to mask as the target, then
 # performs aggregation and prediction on the masked nodes. (Note a lot of wasted computation)
 # since we are predicting all nodes in the graph, and then backpropagating through the target nodes only
 class JEPA_Layer(GINConv):
